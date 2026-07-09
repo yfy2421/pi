@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added message-anchored tool loading: `UserMessage` and `ToolResultMessage` accept an `addedTools` array introducing tool definitions mid-conversation. On Anthropic models that support tool references, tool-result-anchored tools are sent as `defer_loading` definitions plus `tool_reference` blocks inside the anchoring tool result, so late-added tools do not invalidate the cached prompt prefix. All other providers (and Anthropic models without support, e.g. Haiku) fold added tools into the request tool list. Includes a new `AnthropicMessagesCompat.supportsToolReferences` override and exported `unionContextTools`/`mergeToolLists`/`collectAddedTools` helpers.
 - Added a separate opt-in `max` thinking level, including native `xhigh` and `max` support for GPT-5.6 and Anthropic adaptive-thinking effort metadata matching Anthropic's documentation: `max` on all adaptive Claude models, native `xhigh` on Opus 4.7/4.8, Sonnet 5, and Fable 5 only.
 
 ### Fixed

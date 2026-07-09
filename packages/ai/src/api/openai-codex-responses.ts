@@ -36,6 +36,7 @@ import type {
 	Usage,
 } from "../types.ts";
 import { combineAbortSignals } from "../utils/abort-signals.ts";
+import { unionContextTools } from "../utils/added-tools.ts";
 import {
 	appendAssistantMessageDiagnostic,
 	createAssistantMessageDiagnostic,
@@ -506,8 +507,9 @@ function buildRequestBody(
 		body.service_tier = options.serviceTier;
 	}
 
-	if (context.tools && context.tools.length > 0) {
-		body.tools = convertResponsesTools(context.tools, { strict: null });
+	const effectiveTools = unionContextTools(context);
+	if (effectiveTools && effectiveTools.length > 0) {
+		body.tools = convertResponsesTools(effectiveTools, { strict: null });
 	}
 
 	if (options?.reasoningEffort !== undefined) {

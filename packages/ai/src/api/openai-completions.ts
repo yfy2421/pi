@@ -32,6 +32,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
+import { unionContextTools } from "../utils/added-tools.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
@@ -579,8 +580,9 @@ function buildParams(
 		params.temperature = options.temperature;
 	}
 
-	if (context.tools && context.tools.length > 0) {
-		params.tools = convertTools(context.tools, compat);
+	const effectiveTools = unionContextTools(context);
+	if (effectiveTools && effectiveTools.length > 0) {
+		params.tools = convertTools(effectiveTools, compat);
 		if (compat.zaiToolStream) {
 			(params as any).tool_stream = true;
 		}

@@ -29,6 +29,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
+import { unionContextTools } from "../utils/added-tools.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.ts";
@@ -98,6 +99,8 @@ const claudeCodeTools = [
 const ccToolLookup = new Map(claudeCodeTools.map((t) => [t.toLowerCase(), t]));
 
 // Convert tool name to CC canonical casing if it matches (case-insensitive)
+type ToolNameMapper = (name: string) => string;
+const identityToolName: ToolNameMapper = (name) => name;
 const toClaudeCodeName = (name: string) => ccToolLookup.get(name.toLowerCase()) ?? name;
 const fromClaudeCodeName = (name: string, tools?: Tool[]) => {
 	if (tools && tools.length > 0) {
@@ -177,7 +180,124 @@ function getAnthropicCompat(
 		supportsCacheControlOnTools: model.compat?.supportsCacheControlOnTools ?? true,
 		supportsTemperature: model.compat?.supportsTemperature ?? true,
 		allowEmptySignature: model.compat?.allowEmptySignature ?? false,
+		supportsToolReferences: model.compat?.supportsToolReferences ?? defaultSupportsToolReferences(model),
 	};
+}
+
+/**
+ * Default for `supportsToolReferences`: first-party Anthropic models except
+ * Haiku (rejects client-side tool_reference blocks) and models that predate
+ * tool search (Claude 3.x, Opus/Sonnet 4.0, Opus 4.1).
+ */
+function defaultSupportsToolReferences(model: Model<"anthropic-messages">): boolean {
+	if (model.provider !== "anthropic") return false;
+	const id = model.id;
+	if (id.includes("haiku")) return false;
+	if (id.includes("claude-3")) return false;
+	if (/^claude-(?:opus|sonnet)-4(?:-0)?(?:-\d{8})?$/.test(id)) return false;
+	if (/^claude-opus-4-1(?:-\d{8})?$/.test(id)) return false;
+	return true;
+}
+
+/**
+ * How tools are split for an Anthropic request when messages carry
+ * `addedTools` annotations.
+ *
+ * - `prefixTools` render as plain tool definitions (part of the cached prefix).
+ * - `deferredTools` render with `defer_loading: true` and are loaded into the
+ *   model's context through `tool_reference` blocks anchored inside the
+ *   tool results that introduced them, leaving the cached prefix untouched.
+ *
+ * Tools anchored to user messages have no valid `tool_reference` anchor
+ * (references are only accepted inside tool_result content), so they fold
+ * into the prefix instead. Same-name redefinitions and collisions with
+ * `Context.tools` also fold into the prefix so historical tool uses cannot
+ * appear before the surviving load point. When there is no prefix tool at all,
+ * everything folds into the prefix because the API requires at least one
+ * non-deferred tool definition.
+ */
+interface AnthropicToolPlacement {
+	prefixTools: Tool[];
+	deferredTools: Tool[];
+	deferredReferencesByMessageIndex: Map<number, Set<string>>;
+}
+
+function mergeToolListsByOutputName(
+	baseTools: Tool[] | undefined,
+	added: ReadonlyMap<string, Tool>,
+	outputToolName: ToolNameMapper,
+): Tool[] | undefined {
+	if (!baseTools && added.size === 0) return undefined;
+	const merged = new Map<string, Tool>();
+	const order: string[] = [];
+	for (const tool of baseTools ?? []) {
+		const key = outputToolName(tool.name);
+		if (!merged.has(key)) order.push(key);
+		merged.set(key, tool);
+	}
+	for (const tool of added.values()) {
+		const key = outputToolName(tool.name);
+		if (!merged.has(key)) order.push(key);
+		merged.set(key, tool);
+	}
+	return order.map((key) => merged.get(key)!);
+}
+
+function resolveToolPlacement(
+	context: Context,
+	supportsToolReferences: boolean,
+	outputToolName: ToolNameMapper = identityToolName,
+): AnthropicToolPlacement {
+	interface AddedToolOccurrence {
+		tool: Tool;
+		placement: "deferred" | "folded";
+		messageIndex: number;
+		count: number;
+		collidesWithBaseTool: boolean;
+	}
+
+	const baseToolNames = new Set((context.tools ?? []).map((tool) => outputToolName(tool.name)));
+	const latestAddedTools = new Map<string, AddedToolOccurrence>();
+	for (const [messageIndex, msg] of context.messages.entries()) {
+		if (msg.role !== "user" && msg.role !== "toolResult") continue;
+		if (!msg.addedTools?.length) continue;
+		const placement = supportsToolReferences && msg.role === "toolResult" ? "deferred" : "folded";
+		for (const tool of msg.addedTools) {
+			const key = outputToolName(tool.name);
+			latestAddedTools.set(key, {
+				tool,
+				placement,
+				messageIndex,
+				count: (latestAddedTools.get(key)?.count ?? 0) + 1,
+				collidesWithBaseTool: baseToolNames.has(key),
+			});
+		}
+	}
+
+	const deferred = new Map<string, Tool>();
+	const folded = new Map<string, Tool>();
+	const deferredReferencesByMessageIndex = new Map<number, Set<string>>();
+	for (const [key, occurrence] of latestAddedTools) {
+		// A deferred tool can only be loaded at one transcript position. If the
+		// same output name was already present in Context.tools, or appears in
+		// addedTools more than once, folding the latest definition into the prefix
+		// is the only safe replay: otherwise historical tool_use blocks can appear
+		// before the surviving tool_reference load point.
+		if (occurrence.placement === "deferred" && occurrence.count === 1 && !occurrence.collidesWithBaseTool) {
+			deferred.set(key, occurrence.tool);
+			const references = deferredReferencesByMessageIndex.get(occurrence.messageIndex) ?? new Set<string>();
+			references.add(occurrence.tool.name);
+			deferredReferencesByMessageIndex.set(occurrence.messageIndex, references);
+		} else {
+			folded.set(key, occurrence.tool);
+		}
+	}
+
+	const prefixTools = mergeToolListsByOutputName(context.tools, folded, outputToolName) ?? [];
+	if (deferred.size > 0 && prefixTools.length === 0) {
+		return { prefixTools: [...deferred.values()], deferredTools: [], deferredReferencesByMessageIndex: new Map() };
+	}
+	return { prefixTools, deferredTools: [...deferred.values()], deferredReferencesByMessageIndex };
 }
 
 export interface AnthropicOptions extends StreamOptions {
@@ -526,6 +646,9 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				client = created.client;
 				isOAuth = created.isOAuthToken;
 			}
+			const responseTools = isOAuth
+				? getResponseToolNameLookup(context, getAnthropicCompat(model).supportsToolReferences)
+				: undefined;
 			let params = buildParams(model, context, isOAuth, options);
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
@@ -590,7 +713,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 							type: "toolCall",
 							id: event.content_block.id,
 							name: isOAuth
-								? fromClaudeCodeName(event.content_block.name, context.tools)
+								? fromClaudeCodeName(event.content_block.name, responseTools)
 								: event.content_block.name,
 							arguments: (event.content_block.input as Record<string, any>) ?? {},
 							partialJson: "",
@@ -907,9 +1030,22 @@ function buildParams(
 ): MessageCreateParamsStreaming {
 	const { cacheControl } = getCacheControl(model, options?.cacheRetention, options?.env);
 	const compat = getAnthropicCompat(model);
+	const transformedMessages = transformMessages(context.messages, model, normalizeToolCallId);
+	const transformedContext: Context = { ...context, messages: transformedMessages };
+	const toolPlacement = resolveToolPlacement(
+		transformedContext,
+		compat.supportsToolReferences,
+		isOAuthToken ? toClaudeCodeName : identityToolName,
+	);
 	const params: MessageCreateParamsStreaming = {
 		model: model.id,
-		messages: convertMessages(context.messages, model, isOAuthToken, cacheControl, compat.allowEmptySignature),
+		messages: convertMessages(
+			transformedMessages,
+			isOAuthToken,
+			cacheControl,
+			compat.allowEmptySignature,
+			toolPlacement.deferredReferencesByMessageIndex,
+		),
 		max_tokens: options?.maxTokens ?? model.maxTokens,
 		stream: true,
 	};
@@ -946,13 +1082,25 @@ function buildParams(
 		params.temperature = options.temperature;
 	}
 
-	if (context.tools && context.tools.length > 0) {
-		params.tools = convertTools(
-			context.tools,
-			isOAuthToken,
-			compat.supportsEagerToolInputStreaming,
-			compat.supportsCacheControlOnTools ? cacheControl : undefined,
-		);
+	if (toolPlacement.prefixTools.length > 0 || toolPlacement.deferredTools.length > 0) {
+		params.tools = [
+			...convertTools(
+				toolPlacement.prefixTools,
+				isOAuthToken,
+				compat.supportsEagerToolInputStreaming,
+				compat.supportsCacheControlOnTools ? cacheControl : undefined,
+			),
+			// Deferred tools must not carry cache_control (the API rejects it) and
+			// never enter the cached prefix; the tool_reference blocks in the
+			// transcript are their load points.
+			...convertTools(
+				toolPlacement.deferredTools,
+				isOAuthToken,
+				compat.supportsEagerToolInputStreaming,
+				undefined,
+				true,
+			),
+		];
 	}
 
 	// Configure thinking mode: adaptive, budget-based, or explicitly disabled.
@@ -1009,17 +1157,58 @@ function normalizeToolCallId(id: string): string {
 	return id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
 }
 
+function buildToolResultBlock(
+	msg: ToolResultMessage,
+	messageIndex: number,
+	isOAuthToken: boolean,
+	deferredReferencesByMessageIndex: ReadonlyMap<number, ReadonlySet<string>>,
+): ContentBlockParam {
+	const converted = convertContentBlocks(msg.content);
+	const deferredReferences = deferredReferencesByMessageIndex.get(messageIndex);
+	if (!deferredReferences || !msg.addedTools?.length) {
+		return {
+			type: "tool_result",
+			tool_use_id: msg.toolCallId,
+			content: converted,
+			is_error: msg.isError,
+		};
+	}
+	const references = msg.addedTools
+		.filter((tool) => deferredReferences.has(tool.name))
+		.map((tool) => ({
+			type: "tool_reference" as const,
+			tool_name: isOAuthToken ? toClaudeCodeName(tool.name) : tool.name,
+		}));
+	if (references.length === 0) {
+		return {
+			type: "tool_result",
+			tool_use_id: msg.toolCallId,
+			content: converted,
+			is_error: msg.isError,
+		};
+	}
+	const blocks =
+		typeof converted === "string"
+			? converted.trim().length > 0
+				? [{ type: "text" as const, text: converted }]
+				: []
+			: converted;
+	return {
+		type: "tool_result",
+		tool_use_id: msg.toolCallId,
+		content: [...blocks, ...references],
+		is_error: msg.isError,
+	};
+}
+
 function convertMessages(
-	messages: Message[],
-	model: Model<"anthropic-messages">,
+	transformedMessages: Message[],
 	isOAuthToken: boolean,
 	cacheControl?: CacheControlEphemeral,
 	allowEmptySignature = false,
+	deferredReferencesByMessageIndex: ReadonlyMap<number, ReadonlySet<string>> = new Map(),
 ): MessageParam[] {
 	const params: MessageParam[] = [];
-
-	// Transform messages for cross-provider compatibility
-	const transformedMessages = transformMessages(messages, model, normalizeToolCallId);
 
 	for (let i = 0; i < transformedMessages.length; i++) {
 		const msg = transformedMessages[i];
@@ -1124,23 +1313,13 @@ function convertMessages(
 			const toolResults: ContentBlockParam[] = [];
 
 			// Add the current tool result
-			toolResults.push({
-				type: "tool_result",
-				tool_use_id: msg.toolCallId,
-				content: convertContentBlocks(msg.content),
-				is_error: msg.isError,
-			});
+			toolResults.push(buildToolResultBlock(msg, i, isOAuthToken, deferredReferencesByMessageIndex));
 
 			// Look ahead for consecutive toolResult messages
 			let j = i + 1;
 			while (j < transformedMessages.length && transformedMessages[j].role === "toolResult") {
 				const nextMsg = transformedMessages[j] as ToolResultMessage; // We know it's a toolResult
-				toolResults.push({
-					type: "tool_result",
-					tool_use_id: nextMsg.toolCallId,
-					content: convertContentBlocks(nextMsg.content),
-					is_error: nextMsg.isError,
-				});
+				toolResults.push(buildToolResultBlock(nextMsg, j, isOAuthToken, deferredReferencesByMessageIndex));
 				j++;
 			}
 
@@ -1183,7 +1362,12 @@ function convertMessages(
 }
 
 function shouldUseFineGrainedToolStreamingBeta(model: Model<"anthropic-messages">, context: Context): boolean {
-	return !!context.tools?.length && !getAnthropicCompat(model).supportsEagerToolInputStreaming;
+	return !!unionContextTools(context)?.length && !getAnthropicCompat(model).supportsEagerToolInputStreaming;
+}
+
+function getResponseToolNameLookup(context: Context, supportsToolReferences: boolean): Tool[] | undefined {
+	const placement = resolveToolPlacement(context, supportsToolReferences, toClaudeCodeName);
+	return [...placement.prefixTools, ...placement.deferredTools];
 }
 
 function convertTools(
@@ -1191,6 +1375,7 @@ function convertTools(
 	isOAuthToken: boolean,
 	supportsEagerToolInputStreaming: boolean,
 	cacheControl?: CacheControlEphemeral,
+	deferLoading = false,
 ): Anthropic.Messages.Tool[] {
 	if (!tools) return [];
 
@@ -1206,6 +1391,7 @@ function convertTools(
 				properties: schema.properties ?? {},
 				required: schema.required ?? [],
 			},
+			...(deferLoading ? { defer_loading: true } : {}),
 			...(cacheControl && index === tools.length - 1 ? { cache_control: cacheControl } : {}),
 		};
 	});
