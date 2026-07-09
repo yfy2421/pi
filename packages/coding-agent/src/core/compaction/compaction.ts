@@ -239,6 +239,7 @@ function estimateTextAndImageContentChars(content: string | Array<{ type: string
 	}
 
 	let chars = 0;
+	if (!Array.isArray(content)) return 0;
 	for (const block of content) {
 		if (block.type === "text" && block.text) {
 			chars += block.text.length;
