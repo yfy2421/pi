@@ -376,8 +376,24 @@ interface OpenAIToolPayload {
 	name?: string;
 }
 
+interface OpenAIToolSearchOutputPayload {
+	type: "tool_search_output";
+	call_id?: string | null;
+	execution?: string;
+	status?: string | null;
+	tools: Array<{ type: string; name: string; defer_loading?: boolean }>;
+}
+
+interface OpenAIToolSearchCallPayload {
+	type: "tool_search_call";
+	call_id?: string | null;
+	execution?: string;
+	status?: string | null;
+}
+
 interface OpenAIPayload {
 	tools?: OpenAIToolPayload[];
+	input?: Array<OpenAIToolSearchCallPayload | OpenAIToolSearchOutputPayload | { type?: string }>;
 }
 
 function toolNames(payload: OpenAIPayload): string[] {
@@ -392,11 +408,24 @@ describe("added tools (fallback providers)", () => {
 		expect(toolNames(payload)).toEqual(["base_tool", "late_tool"]);
 	});
 
-	it("folds added tools into the tool list on openai-responses", async () => {
+	it("loads tool-result-anchored tools through OpenAI tool_search_output", async () => {
 		const context = makeToolResultAnchoredContext([makeTool("base_tool")], [makeTool("late_tool")]);
 		const payload = await capturePayload<OpenAIPayload>(getModel("openai", "gpt-5.2"), context);
 
-		expect(toolNames(payload)).toEqual(["base_tool", "late_tool"]);
+		expect(toolNames(payload)).toEqual(["base_tool"]);
+		const searchCall = payload.input?.find(
+			(item): item is OpenAIToolSearchCallPayload => item.type === "tool_search_call",
+		);
+		const searchOutput = payload.input?.find(
+			(item): item is OpenAIToolSearchOutputPayload => item.type === "tool_search_output",
+		);
+		expect(searchCall?.execution).toBe("client");
+		expect(searchCall?.status).toBe("completed");
+		expect(searchOutput?.call_id).toBe(searchCall?.call_id);
+		expect(searchOutput?.execution).toBe("client");
+		expect(searchOutput?.status).toBe("completed");
+		const lateTool = searchOutput?.tools.find((tool) => tool.name === "late_tool");
+		expect(lateTool).toMatchObject({ type: "function", name: "late_tool", defer_loading: true });
 	});
 
 	it("overrides same-named base tools with the added definition", async () => {

@@ -15,14 +15,18 @@ import type {
 	StreamOptions,
 	Usage,
 } from "../types.ts";
-import { unionContextTools } from "../utils/added-tools.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
-import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
+import {
+	convertResponsesMessages,
+	convertResponsesTools,
+	processResponsesStream,
+	resolveOpenAIResponsesToolPlacement,
+} from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
@@ -221,7 +225,10 @@ function createClient(
 }
 
 function buildParams(model: Model<"openai-responses">, context: Context, options?: OpenAIResponsesOptions) {
-	const messages = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS);
+	const toolPlacement = resolveOpenAIResponsesToolPlacement(context);
+	const messages = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS, {
+		deferredToolsByMessageIndex: toolPlacement.deferredToolsByMessageIndex,
+	});
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
 	const compat = getCompat(model);
@@ -246,9 +253,8 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 		params.service_tier = options.serviceTier;
 	}
 
-	const effectiveTools = unionContextTools(context);
-	if (effectiveTools && effectiveTools.length > 0) {
-		params.tools = convertResponsesTools(effectiveTools);
+	if (toolPlacement.prefixTools.length > 0) {
+		params.tools = convertResponsesTools(toolPlacement.prefixTools);
 	}
 
 	if (model.reasoning) {

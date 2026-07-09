@@ -6,11 +6,13 @@ import type {
 	ResponseInput,
 	ResponseInputContent,
 	ResponseInputImage,
+	ResponseInputItem,
 	ResponseInputText,
 	ResponseOutputItem,
 	ResponseOutputMessage,
 	ResponseReasoningItem,
 	ResponseStreamEvent,
+	ResponseToolSearchOutputItemParam,
 } from "openai/resources/responses/responses.js";
 import { calculateCost } from "../models.ts";
 import type {
@@ -77,10 +79,77 @@ export interface OpenAIResponsesStreamOptions {
 
 export interface ConvertResponsesMessagesOptions {
 	includeSystemPrompt?: boolean;
+	deferredToolsByMessageIndex?: ReadonlyMap<number, readonly Tool[]>;
 }
 
 export interface ConvertResponsesToolsOptions {
 	strict?: boolean | null;
+	deferLoading?: boolean;
+}
+
+type OpenAIFunctionTool = Extract<OpenAITool, { type: "function" }>;
+
+export interface OpenAIResponsesToolPlacement {
+	prefixTools: Tool[];
+	deferredToolsByMessageIndex: Map<number, Tool[]>;
+}
+
+function mergeToolListsByName(baseTools: Tool[] | undefined, added: ReadonlyMap<string, Tool>): Tool[] {
+	const merged = new Map<string, Tool>();
+	const order: string[] = [];
+	for (const tool of baseTools ?? []) {
+		if (!merged.has(tool.name)) order.push(tool.name);
+		merged.set(tool.name, tool);
+	}
+	for (const tool of added.values()) {
+		if (!merged.has(tool.name)) order.push(tool.name);
+		merged.set(tool.name, tool);
+	}
+	return order.map((name) => merged.get(name)!);
+}
+
+export function resolveOpenAIResponsesToolPlacement(context: Context): OpenAIResponsesToolPlacement {
+	interface AddedToolOccurrence {
+		tool: Tool;
+		placement: "deferred" | "folded";
+		messageIndex: number;
+		count: number;
+		collidesWithBaseTool: boolean;
+	}
+
+	const baseToolNames = new Set((context.tools ?? []).map((tool) => tool.name));
+	const latestAddedTools = new Map<string, AddedToolOccurrence>();
+	for (const [messageIndex, msg] of context.messages.entries()) {
+		if (msg.role !== "user" && msg.role !== "toolResult") continue;
+		if (!msg.addedTools?.length) continue;
+		const placement = msg.role === "toolResult" ? "deferred" : "folded";
+		for (const tool of msg.addedTools) {
+			latestAddedTools.set(tool.name, {
+				tool,
+				placement,
+				messageIndex,
+				count: (latestAddedTools.get(tool.name)?.count ?? 0) + 1,
+				collidesWithBaseTool: baseToolNames.has(tool.name),
+			});
+		}
+	}
+
+	const folded = new Map<string, Tool>();
+	const deferredToolsByMessageIndex = new Map<number, Tool[]>();
+	for (const [name, occurrence] of latestAddedTools) {
+		if (occurrence.placement === "deferred" && occurrence.count === 1 && !occurrence.collidesWithBaseTool) {
+			const tools = deferredToolsByMessageIndex.get(occurrence.messageIndex) ?? [];
+			tools.push(occurrence.tool);
+			deferredToolsByMessageIndex.set(occurrence.messageIndex, tools);
+		} else {
+			folded.set(name, occurrence.tool);
+		}
+	}
+
+	return {
+		prefixTools: mergeToolListsByName(context.tools, folded),
+		deferredToolsByMessageIndex,
+	};
 }
 
 // =============================================================================
@@ -259,6 +328,27 @@ export function convertResponsesMessages<TApi extends Api>(
 				call_id: callId,
 				output,
 			});
+
+			const deferredTools = options?.deferredToolsByMessageIndex?.get(msgIndex);
+			if (deferredTools && deferredTools.length > 0) {
+				const searchCallId = `pi_tool_load_${shortHash(`${msg.toolCallId}:${deferredTools.map((tool) => tool.name).join(",")}`)}`;
+				messages.push({
+					type: "tool_search_call",
+					id: `tsc_${shortHash(searchCallId)}`,
+					call_id: searchCallId,
+					execution: "client",
+					status: "completed",
+					arguments: { query: deferredTools.map((tool) => tool.name).join(" "), limit: deferredTools.length },
+				} satisfies ResponseInputItem);
+				messages.push({
+					type: "tool_search_output",
+					id: `tso_${shortHash(searchCallId)}`,
+					call_id: searchCallId,
+					execution: "client",
+					status: "completed",
+					tools: convertResponsesTools(deferredTools, { deferLoading: true }),
+				} satisfies ResponseToolSearchOutputItemParam);
+			}
 		}
 		msgIndex++;
 	}
@@ -270,15 +360,18 @@ export function convertResponsesMessages<TApi extends Api>(
 // Tool conversion
 // =============================================================================
 
-export function convertResponsesTools(tools: Tool[], options?: ConvertResponsesToolsOptions): OpenAITool[] {
+export function convertResponsesTools(tools: readonly Tool[], options?: ConvertResponsesToolsOptions): OpenAITool[] {
 	const strict = options?.strict === undefined ? false : options.strict;
-	return tools.map((tool) => ({
-		type: "function",
-		name: tool.name,
-		description: tool.description,
-		parameters: tool.parameters as any, // TypeBox already generates JSON Schema
-		strict,
-	}));
+	return tools.map(
+		(tool): OpenAIFunctionTool => ({
+			type: "function",
+			name: tool.name,
+			description: tool.description,
+			parameters: tool.parameters as Record<string, unknown>, // TypeBox already generates JSON Schema
+			strict,
+			...(options?.deferLoading ? { defer_loading: true } : {}),
+		}),
+	);
 }
 
 // =============================================================================
