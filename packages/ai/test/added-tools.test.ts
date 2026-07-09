@@ -153,9 +153,29 @@ describe("added tools (Anthropic native path)", () => {
 		expect(blocks.some((b) => b.type === "tool_reference" && b.tool_name === "late_tool")).toBe(true);
 	});
 
-	it("folds an added tool when it is also in Context.tools", async () => {
+	it("defers an active added tool when it has no prior tool use", async () => {
 		const lateTool = makeTool("late_tool");
 		const context = makeToolResultAnchoredContext([makeTool("base_tool"), lateTool], [lateTool]);
+		const payload = await capturePayload<AnthropicPayload>(getModel("anthropic", "claude-opus-4-6"), context);
+
+		expect(payload.tools?.map((t) => t.name)).toEqual(["base_tool", "late_tool"]);
+		expect(payload.tools?.[1]?.defer_loading).toBe(true);
+		const toolResult = findToolResultBlock(payload);
+		const blocks = toolResult.content as Array<{ type: string; tool_name?: string }>;
+		expect(blocks.some((block) => block.type === "tool_reference" && block.tool_name === "late_tool")).toBe(true);
+	});
+
+	it("folds an active added tool when the same name was used before its load point", async () => {
+		const lateTool = makeTool("late_tool");
+		const context: Context = {
+			messages: [
+				makeUserMessage(),
+				makeAssistantToolCall("call_1", "late_tool"),
+				makeToolResultMessage("call_1", [lateTool]),
+				makeUserMessage(),
+			],
+			tools: [makeTool("base_tool"), lateTool],
+		};
 		const payload = await capturePayload<AnthropicPayload>(getModel("anthropic", "claude-opus-4-6"), context);
 
 		expect(payload.tools?.map((t) => t.name)).toEqual(["base_tool", "late_tool"]);
@@ -321,7 +341,7 @@ describe("added tools (Anthropic native path)", () => {
 		expect(payload.tools?.[0]?.description).toBe("Uppercase read");
 	});
 
-	it("folds OAuth-canonicalized added tools that collide with base tools", async () => {
+	it("defers active OAuth-canonicalized added tools with no prior tool use", async () => {
 		const context = makeToolResultAnchoredContext(
 			[makeTool("bash"), makeTool("read")],
 			[{ ...makeTool("Read"), description: "Deferred read" }],
@@ -334,11 +354,10 @@ describe("added tools (Anthropic native path)", () => {
 
 		expect(payload.tools?.map((tool) => tool.name)).toEqual(["Bash", "Read"]);
 		expect(payload.tools?.find((tool) => tool.name === "Bash")?.defer_loading).toBeUndefined();
-		expect(payload.tools?.find((tool) => tool.name === "Read")?.defer_loading).toBeUndefined();
+		expect(payload.tools?.find((tool) => tool.name === "Read")?.defer_loading).toBe(true);
 		const toolResult = findToolResultBlock(payload);
-		if (Array.isArray(toolResult.content)) {
-			expect(toolResult.content.some((block) => block.type === "tool_reference")).toBe(false);
-		}
+		const blocks = toolResult.content as Array<{ type: string; tool_name?: string }>;
+		expect(blocks.some((block) => block.type === "tool_reference" && block.tool_name === "Read")).toBe(true);
 	});
 
 	it("folds a colliding deferred OAuth tool when no non-deferred tool remains", async () => {
@@ -408,8 +427,9 @@ describe("added tools (fallback providers)", () => {
 		expect(toolNames(payload)).toEqual(["base_tool", "late_tool"]);
 	});
 
-	it("loads tool-result-anchored tools through OpenAI tool_search_output", async () => {
-		const context = makeToolResultAnchoredContext([makeTool("base_tool")], [makeTool("late_tool")]);
+	it("loads active tool-result-anchored tools through OpenAI tool_search_output", async () => {
+		const lateTool = makeTool("late_tool");
+		const context = makeToolResultAnchoredContext([makeTool("base_tool"), lateTool], [lateTool]);
 		const payload = await capturePayload<OpenAIPayload>(getModel("openai", "gpt-5.2"), context);
 
 		expect(toolNames(payload)).toEqual(["base_tool"]);
@@ -424,8 +444,8 @@ describe("added tools (fallback providers)", () => {
 		expect(searchOutput?.call_id).toBe(searchCall?.call_id);
 		expect(searchOutput?.execution).toBe("client");
 		expect(searchOutput?.status).toBe("completed");
-		const lateTool = searchOutput?.tools.find((tool) => tool.name === "late_tool");
-		expect(lateTool).toMatchObject({ type: "function", name: "late_tool", defer_loading: true });
+		const loadedTool = searchOutput?.tools.find((tool) => tool.name === "late_tool");
+		expect(loadedTool).toMatchObject({ type: "function", name: "late_tool", defer_loading: true });
 	});
 
 	it("overrides same-named base tools with the added definition", async () => {

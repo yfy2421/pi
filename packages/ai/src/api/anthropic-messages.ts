@@ -210,11 +210,11 @@ function defaultSupportsToolReferences(model: Model<"anthropic-messages">): bool
  *
  * Tools anchored to user messages have no valid `tool_reference` anchor
  * (references are only accepted inside tool_result content), so they fold
- * into the prefix instead. Same-name redefinitions and collisions with
- * `Context.tools` also fold into the prefix so historical tool uses cannot
- * appear before the surviving load point. When there is no prefix tool at all,
- * everything folds into the prefix because the API requires at least one
- * non-deferred tool definition.
+ * into the prefix instead. Same-name redefinitions and tools already used
+ * earlier in the transcript also fold into the prefix so historical tool uses
+ * cannot appear before the surviving load point. When there is no prefix tool
+ * at all, everything folds into the prefix because the API requires at least
+ * one non-deferred tool definition.
  */
 interface AnthropicToolPlacement {
 	prefixTools: Tool[];
@@ -253,12 +253,20 @@ function resolveToolPlacement(
 		placement: "deferred" | "folded";
 		messageIndex: number;
 		count: number;
-		collidesWithBaseTool: boolean;
+		hasPriorToolUse: boolean;
 	}
 
-	const baseToolNames = new Set((context.tools ?? []).map((tool) => outputToolName(tool.name)));
+	const usedToolNames = new Set<string>();
 	const latestAddedTools = new Map<string, AddedToolOccurrence>();
 	for (const [messageIndex, msg] of context.messages.entries()) {
+		if (msg.role === "assistant") {
+			for (const block of msg.content) {
+				if (block.type === "toolCall") {
+					usedToolNames.add(outputToolName(block.name));
+				}
+			}
+			continue;
+		}
 		if (msg.role !== "user" && msg.role !== "toolResult") continue;
 		if (!msg.addedTools?.length) continue;
 		const placement = supportsToolReferences && msg.role === "toolResult" ? "deferred" : "folded";
@@ -269,7 +277,7 @@ function resolveToolPlacement(
 				placement,
 				messageIndex,
 				count: (latestAddedTools.get(key)?.count ?? 0) + 1,
-				collidesWithBaseTool: baseToolNames.has(key),
+				hasPriorToolUse: usedToolNames.has(key),
 			});
 		}
 	}
@@ -279,11 +287,11 @@ function resolveToolPlacement(
 	const deferredReferencesByMessageIndex = new Map<number, Set<string>>();
 	for (const [key, occurrence] of latestAddedTools) {
 		// A deferred tool can only be loaded at one transcript position. If the
-		// same output name was already present in Context.tools, or appears in
-		// addedTools more than once, folding the latest definition into the prefix
-		// is the only safe replay: otherwise historical tool_use blocks can appear
-		// before the surviving tool_reference load point.
-		if (occurrence.placement === "deferred" && occurrence.count === 1 && !occurrence.collidesWithBaseTool) {
+		// same output name appears in addedTools more than once, or was already
+		// used before this load point, folding the latest definition into the
+		// prefix is the only safe replay: otherwise historical tool_use blocks can
+		// appear before the surviving tool_reference load point.
+		if (occurrence.placement === "deferred" && occurrence.count === 1 && !occurrence.hasPriorToolUse) {
 			deferred.set(key, occurrence.tool);
 			const references = deferredReferencesByMessageIndex.get(occurrence.messageIndex) ?? new Set<string>();
 			references.add(occurrence.tool.name);
@@ -293,7 +301,9 @@ function resolveToolPlacement(
 		}
 	}
 
-	const prefixTools = mergeToolListsByOutputName(context.tools, folded, outputToolName) ?? [];
+	const prefixTools = (mergeToolListsByOutputName(context.tools, folded, outputToolName) ?? []).filter(
+		(tool) => !deferred.has(outputToolName(tool.name)),
+	);
 	if (deferred.size > 0 && prefixTools.length === 0) {
 		return { prefixTools: [...deferred.values()], deferredTools: [], deferredReferencesByMessageIndex: new Map() };
 	}

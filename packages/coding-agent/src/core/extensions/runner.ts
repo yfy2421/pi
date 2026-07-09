@@ -58,6 +58,7 @@ import type {
 	SessionShutdownEvent,
 	ToolCallEvent,
 	ToolCallEventResult,
+	ToolInfo,
 	ToolResultEvent,
 	ToolResultEventResult,
 	UserBashEvent,
@@ -621,6 +622,16 @@ export class ExtensionRunner {
 	 */
 	shutdown(): void {
 		this.shutdownHandler();
+	}
+
+	getActiveTools(): string[] {
+		this.assertActive();
+		return this.runtime.getActiveTools();
+	}
+
+	getAllTools(): ToolInfo[] {
+		this.assertActive();
+		return this.runtime.getAllTools();
 	}
 
 	/**

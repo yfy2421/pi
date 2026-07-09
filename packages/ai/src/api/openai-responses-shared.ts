@@ -114,12 +114,20 @@ export function resolveOpenAIResponsesToolPlacement(context: Context): OpenAIRes
 		placement: "deferred" | "folded";
 		messageIndex: number;
 		count: number;
-		collidesWithBaseTool: boolean;
+		hasPriorToolUse: boolean;
 	}
 
-	const baseToolNames = new Set((context.tools ?? []).map((tool) => tool.name));
+	const usedToolNames = new Set<string>();
 	const latestAddedTools = new Map<string, AddedToolOccurrence>();
 	for (const [messageIndex, msg] of context.messages.entries()) {
+		if (msg.role === "assistant") {
+			for (const block of msg.content) {
+				if (block.type === "toolCall") {
+					usedToolNames.add(block.name);
+				}
+			}
+			continue;
+		}
 		if (msg.role !== "user" && msg.role !== "toolResult") continue;
 		if (!msg.addedTools?.length) continue;
 		const placement = msg.role === "toolResult" ? "deferred" : "folded";
@@ -129,7 +137,7 @@ export function resolveOpenAIResponsesToolPlacement(context: Context): OpenAIRes
 				placement,
 				messageIndex,
 				count: (latestAddedTools.get(tool.name)?.count ?? 0) + 1,
-				collidesWithBaseTool: baseToolNames.has(tool.name),
+				hasPriorToolUse: usedToolNames.has(tool.name),
 			});
 		}
 	}
@@ -137,7 +145,7 @@ export function resolveOpenAIResponsesToolPlacement(context: Context): OpenAIRes
 	const folded = new Map<string, Tool>();
 	const deferredToolsByMessageIndex = new Map<number, Tool[]>();
 	for (const [name, occurrence] of latestAddedTools) {
-		if (occurrence.placement === "deferred" && occurrence.count === 1 && !occurrence.collidesWithBaseTool) {
+		if (occurrence.placement === "deferred" && occurrence.count === 1 && !occurrence.hasPriorToolUse) {
 			const tools = deferredToolsByMessageIndex.get(occurrence.messageIndex) ?? [];
 			tools.push(occurrence.tool);
 			deferredToolsByMessageIndex.set(occurrence.messageIndex, tools);
@@ -146,8 +154,13 @@ export function resolveOpenAIResponsesToolPlacement(context: Context): OpenAIRes
 		}
 	}
 
+	const deferredNames = new Set(
+		Array.from(deferredToolsByMessageIndex.values())
+			.flat()
+			.map((tool) => tool.name),
+	);
 	return {
-		prefixTools: mergeToolListsByName(context.tools, folded),
+		prefixTools: mergeToolListsByName(context.tools, folded).filter((tool) => !deferredNames.has(tool.name)),
 		deferredToolsByMessageIndex,
 	};
 }
