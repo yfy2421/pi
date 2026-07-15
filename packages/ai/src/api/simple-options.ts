@@ -60,6 +60,8 @@ export function adjustMaxTokensForThinking(
 		low: 2048,
 		medium: 8192,
 		high: 16384,
+		xhigh: 32768,
+		max: 65536,
 	};
 	const budgets = { ...defaultBudgets, ...customBudgets };
 
